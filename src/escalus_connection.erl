@@ -17,6 +17,7 @@
          send/2,
          get_stanza/2,
          get_stanza/3,
+         proxy/2,
          get_sm_h/1,
          set_sm_h/2,
          set_filter_predicate/2,
@@ -161,6 +162,15 @@ get_stanza(Conn, Name, Timeout) ->
             Stanza
     after Timeout ->
             throw({timeout, Name})
+    end.
+
+proxy(Conn, Pid) ->
+    receive
+        {stanza, Conn, Stanza} ->
+            Pid ! Stanza,
+            proxy(Conn, Pid);
+        stop ->
+            ok
     end.
 
 -spec get_sm_h(#client{}) -> non_neg_integer().
