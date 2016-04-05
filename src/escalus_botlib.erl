@@ -41,7 +41,6 @@
 
 -define(SERVER, ?MODULE).
 
--define(PRT(X), io:format("~p~n", [X])).
 -record(state, {userspec, connection, listener, callback}).
 
 %%%===================================================================
@@ -82,7 +81,7 @@ status(Pid, Status, StatusMessage) ->
     gen_fsm:sync_send_event(Pid, {status, Status, StatusMessage}).
 
 unavailable(Pid) ->
-    gen_fsm:sync_send_event(Pid, {status, offline}).
+    gen_fsm:sync_send_event(Pid, {status, unavailable}).
 
 msg(Pid, To, Msg) ->
     gen_fsm:sync_send_event(Pid, {chat, To, Msg}).
@@ -118,7 +117,7 @@ online(disconnect, _From, #state{connection = Conn, listener = Lstn} = State) ->
     disconnect(Lstn, Conn),
     {reply, ok, offline, State#state{connection = undefined}};
 online({status, offline}, _From, #state{connection = Conn} = State) ->
-    go_offline(Conn),
+    go_unavailable(Conn),
     {reply, ok, online, State};
 online({status, Status}, _From, #state{connection = Conn} = State) ->
     send_status(Status, Conn),
@@ -136,8 +135,8 @@ online(Msg, _From, State) ->
 online(disconnect, #state{connection = Conn, listener = Lstn} = State) ->
     disconnect(Lstn, Conn),
     {next_state, offline, State#state{connection = undefined}};
-online({status, offline}, #state{connection = Conn} = State) ->
-    go_offline(Conn),
+online({status, unavailable}, #state{connection = Conn} = State) ->
+    go_unavailable(Conn),
     {next_state, online, State};
 online({status, Status}, #state{connection = Conn} = State) ->
     send_status(Status, Conn),
@@ -231,7 +230,7 @@ send_status(StatusMessage, Status, Conn) ->
     ]),
     escalus_connection:send(Conn, escalus_stanza:presence(<<"available">>, Tags)).
 
-go_offline(Conn) ->
+go_unavailable(Conn) ->
     escalus_connection:send(Conn, escalus_stanza:presence(<<"unavailable">>)).
 
 disconnect(Lstn, Conn) ->
