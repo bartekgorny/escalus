@@ -42,7 +42,7 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {userspec, connection, listener, callback}).
+-record(state, {userspec, connection, callback}).
 
 %%%===================================================================
 %%% API
@@ -76,28 +76,28 @@ disconnect(Pid) ->
     gen_fsm:send_event(Pid, disconnect).
 
 sync_status(Pid, Status) ->
-    gen_fsm:sync_send_event(Pid, {status, Status}).
+    gen_fsm:sync_send_event(Pid, {status, tob(Status)}).
 
 sync_status(Pid, Status, StatusMessage) ->
-    gen_fsm:sync_send_event(Pid, {status, Status, StatusMessage}).
+    gen_fsm:sync_send_event(Pid, {status, tob(Status), tob(StatusMessage)}).
 
 sync_unavailable(Pid) ->
     gen_fsm:sync_send_event(Pid, {status, unavailable}).
 
 sync_msg(Pid, To, Msg) ->
-    gen_fsm:sync_send_event(Pid, {chat, To, Msg}).
+    gen_fsm:sync_send_event(Pid, {chat, To, tob(Msg)}).
 
 status(Pid, Status) ->
-    gen_fsm:send_event(Pid, {status, Status}).
+    gen_fsm:send_event(Pid, {status, tob(Status)}).
 
 status(Pid, Status, StatusMessage) ->
-    gen_fsm:send_event(Pid, {status, Status, StatusMessage}).
+    gen_fsm:send_event(Pid, {status, tob(Status), tob(StatusMessage)}).
 
 unavailable(Pid) ->
     gen_fsm:send_event(Pid, {status, offline}).
 
 msg(Pid, To, Msg) ->
-    gen_fsm:send_event(Pid, {chat, To, Msg}).
+    gen_fsm:send_event(Pid, {chat, To, tob(Msg)}).
 
 %%%===================================================================
 %%% gen_fsm callbacks
@@ -182,7 +182,7 @@ handle_sync_event(_Event, _From, StateName, State) ->
     Reply = ok,
     {reply, Reply, StateName, State}.
 
-handle_info({stanza, _Client, Stanza}, online, #state{callback = Cb, connection = Conn} = State) ->
+handle_info({stanza, _Client, Stanza}, online, #state{callback = Cb} = State) ->
     {Name, Res} = process_stanza(Stanza#xmlel.name, Cb, Stanza),
     ship_stanza(Name, Res, Cb),
     {next_state, online, State};
@@ -288,3 +288,6 @@ try_to_connect(UserSpec) ->
             io:format("Msg was: ~p~n", [E]),
             {error, E}
     end.
+
+tob(S) ->
+    unicode:characters_to_binary(S).
