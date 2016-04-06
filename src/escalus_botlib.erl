@@ -19,17 +19,18 @@
          start_link/3,
          connect/1,
          disconnect/1,
+         sync_status/2,
+         sync_status/3,
+         sync_unavailable/1,
+         sync_msg/3,
          status/2,
          status/3,
          unavailable/1,
-         msg/3,
-         a_status/2,
-         a_status/3,
-         a_unavailable/1,
-         a_msg/3]).
+         msg/3]).
 
 %% gen_fsm callbacks
 -export([init/1,
+         offline/2,
          offline/3,
          online/2,
          online/3,
@@ -69,33 +70,33 @@ start_link(Filename, User, Callback) ->
     gen_fsm:start_link({local, ?SERVER}, ?MODULE, [Filename, User, Callback], []).
 
 connect(Pid) ->
-    gen_fsm:sync_send_event(Pid, connect).
+    gen_fsm:send_event(Pid, connect).
 
 disconnect(Pid) ->
-    gen_fsm:sync_send_event(Pid, disconnect).
+    gen_fsm:send_event(Pid, disconnect).
 
-status(Pid, Status) ->
+sync_status(Pid, Status) ->
     gen_fsm:sync_send_event(Pid, {status, Status}).
 
-status(Pid, Status, StatusMessage) ->
+sync_status(Pid, Status, StatusMessage) ->
     gen_fsm:sync_send_event(Pid, {status, Status, StatusMessage}).
 
-unavailable(Pid) ->
+sync_unavailable(Pid) ->
     gen_fsm:sync_send_event(Pid, {status, unavailable}).
 
-msg(Pid, To, Msg) ->
+sync_msg(Pid, To, Msg) ->
     gen_fsm:sync_send_event(Pid, {chat, To, Msg}).
 
-a_status(Pid, Status) ->
+status(Pid, Status) ->
     gen_fsm:send_event(Pid, {status, Status}).
 
-a_status(Pid, Status, StatusMessage) ->
+status(Pid, Status, StatusMessage) ->
     gen_fsm:send_event(Pid, {status, Status, StatusMessage}).
 
-a_unavailable(Pid) ->
+unavailable(Pid) ->
     gen_fsm:send_event(Pid, {status, offline}).
 
-a_msg(Pid, To, Msg) ->
+msg(Pid, To, Msg) ->
     gen_fsm:send_event(Pid, {chat, To, Msg}).
 
 %%%===================================================================
@@ -105,16 +106,37 @@ a_msg(Pid, To, Msg) ->
 init([Filename, User, Callback]) ->
     {ok, Config} = file:consult(Filename),
     UserSpec = escalus_users:get_options(Config, User),
+    process_flag(trap_exit, true),
     {ok, offline, #state{userspec = UserSpec, callback = Callback}}.
 
-offline(connect, _From, #state{userspec = UserSpec} = State) ->
-    {ok, Conn, _, _} = escalus_connection:start(UserSpec),
-    Pid = self(),
-    Lstn = spawn_link(escalus_connection, proxy, [Conn, Pid]),
-    {reply, ok, online, State#state{connection = Conn, listener = Lstn}}.
+%% offline sync catch-all
+offline(Msg, _From, State) ->
+    ?PRT({offline_sync, "???", Msg}),
+    {reply, ok, offline, State}.
 
-online(disconnect, _From, #state{connection = Conn, listener = Lstn} = State) ->
-    disconnect(Lstn, Conn),
+offline(connect, #state{userspec = UserSpec, callback = Cb} = State) ->
+    Result = try_to_connect(UserSpec),
+    case Result of
+        {ok, Conn} ->
+            {Mod, Args} = Cb,
+            Mod:process(Args, connected, self()),
+            {next_state, online, State#state{connection = Conn}};
+        econnrefused ->
+            ?PRT(connrefused),
+            wait_and_reconnect(),
+            {next_state, offline, State};
+        {error, _} ->
+            {stop, error, error, State}
+    end;
+%% offline async catch-all
+offline(Msg, State) ->
+    ?PRT({offline_async, "???", Msg}),
+    {next_state, offline, State}.
+
+online(disconnect, _From, #state{connection = Conn, callback = Cb} = State) ->
+    do_disconnect(Conn),
+    {Mod, Args} = Cb,
+    Mod:process(Args, disconnected, self()),
     {reply, ok, offline, State#state{connection = undefined}};
 online({status, offline}, _From, #state{connection = Conn} = State) ->
     go_unavailable(Conn),
@@ -128,12 +150,13 @@ online({status, Status, StatusMessage}, _From, #state{connection = Conn} = State
 online({chat, To, Message}, _From, #state{connection = Conn} = State) ->
     escalus_connection:send(Conn, escalus_stanza:chat_to(To, Message)),
     {reply, ok, online, State};
+%% online sync catch-all
 online(Msg, _From, State) ->
-    ?PRT({whaaaat, Msg, "???"}),
+    ?PRT({online_sync, "???", Msg}),
     {reply, ok, online, State}.
 
-online(disconnect, #state{connection = Conn, listener = Lstn} = State) ->
-    disconnect(Lstn, Conn),
+online(disconnect, #state{connection = Conn} = State) ->
+    do_disconnect(Conn),
     {next_state, offline, State#state{connection = undefined}};
 online({status, unavailable}, #state{connection = Conn} = State) ->
     go_unavailable(Conn),
@@ -147,8 +170,9 @@ online({status, Status, StatusMessage}, #state{connection = Conn} = State) ->
 online({chat, To, Message}, #state{connection = Conn} = State) ->
     escalus_connection:send(Conn, escalus_stanza:chat_to(To, Message)),
     {next_state, online, State};
+%% online async catch-all
 online(Msg, State) ->
-    ?PRT({whaaaat, Msg, "???"}),
+    ?PRT({online_async, "???", Msg}),
     {next_state, online, State}.
 
 handle_event(_Event, StateName, State) ->
@@ -158,14 +182,19 @@ handle_sync_event(_Event, _From, StateName, State) ->
     Reply = ok,
     {reply, Reply, StateName, State}.
 
-handle_info({stanza, _Client, Stanza}, online, #state{callback = Cb} = State) ->
+handle_info({stanza, _Client, Stanza}, online, #state{callback = Cb, connection = Conn} = State) ->
     {Name, Res} = process_stanza(Stanza#xmlel.name, Cb, Stanza),
     ship_stanza(Name, Res, Cb),
     {next_state, online, State};
-handle_info(_Info, StateName, State) ->
+handle_info({'EXIT', _, normal}, _StateName, State) ->
+    wait_and_reconnect(),
+    {next_state, offline, State#state{connection = undefined}};
+handle_info(Info, StateName, State) ->
+    ?PRT({info, "???", Info}),
     {next_state, StateName, State}.
 
-terminate(_Reason, _StateName, _State) ->
+terminate(Reason, _StateName, _State) ->
+    ?PRT({terminating_for_reason, Reason}),
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -217,12 +246,16 @@ ship_stanza(<<"message">>, S, {Mod, Args}) ->
 ship_stanza(_, S, {Mod, Args}) ->
     Mod:process(Args, S, self()).
 
+send_status(none, _Conn) ->
+    ok;
 send_status(Status, Conn) ->
     Tags = escalus_stanza:tags([
         {<<"show">>, Status}
     ]),
     escalus_connection:send(Conn, escalus_stanza:presence(<<"available">>, Tags)).
 
+send_status(_, none, _Conn) ->
+    ok;
 send_status(StatusMessage, Status, Conn) ->
     Tags = escalus_stanza:tags([
         {<<"status">>, StatusMessage},
@@ -233,7 +266,25 @@ send_status(StatusMessage, Status, Conn) ->
 go_unavailable(Conn) ->
     escalus_connection:send(Conn, escalus_stanza:presence(<<"unavailable">>)).
 
-disconnect(Lstn, Conn) ->
-    Lstn ! stop,
+do_disconnect(Conn) ->
     escalus_connection:stop(Conn).
 
+wait_and_reconnect() ->
+    timer:apply_after(5000, gen_fsm, send_event, [self(), connect]).
+
+try_to_connect(UserSpec) ->
+    case (catch escalus_connection:start(UserSpec)) of
+        {ok, Conn, _, _} ->
+            {ok, Conn};
+        {'EXIT',
+            {{badmatch,
+                {error,
+                    {{badmatch,{error,econnrefused}},
+                        _}}},
+                _}} -> %% such are idiosyncrasies of escalus
+            econnrefused;
+        E ->
+            io:format("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!~nError while trying to connect - terminating~n"),
+            io:format("Msg was: ~p~n", [E]),
+            {error, E}
+    end.

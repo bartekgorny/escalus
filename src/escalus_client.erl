@@ -38,7 +38,7 @@
 
 -define(WAIT_FOR_STANZA_TIMEOUT, 1000).
 
--include("escalus.hrl").
+-include_lib("escalus/include/escalus.hrl").
 -include_lib("exml/include/exml.hrl").
 
 %%--------------------------------------------------------------------
